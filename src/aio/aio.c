@@ -47,6 +47,26 @@
  * blocked permanently.
  */
 
+ /* 
+ ** aio_thread is a structure that describes an active I/O request.
+ ** it is used to keep track of the state of the I/O request and
+ ** to manage the list of active I/O requests.
+ ** when an I/O request is issued, a new aio_thread structure
+ ** is created and added to the list of active I/O requests.
+ ** when the I/O request completes, the aio_thread structure is
+ ** removed from the list and the results are returned to the
+ ** application, it is done by the cleanup handler (thread cleanup registered at the begining).
+ **
+ **
+ ** struct aio_thread - describes an active I/O request
+ ** *   td - thread id of thread that issued the I/O request
+ ** *   cb - pointer to aiocb for I/O request (passed by the user to aio_read/aio_write)
+ ** *   next - pointer to next I/O request in list
+ ** *   prev - pointer to previous I/O request in list
+ ** *   q - pointer to aio_queue for I/O request
+ ** *   running - indicates whether the I/O request is still running
+ ** *   err - error code for I/O request
+ */
 struct aio_thread {
 	pthread_t td;
 	struct aiocb *cb;
@@ -57,6 +77,17 @@ struct aio_thread {
 	ssize_t ret;
 };
 
+/*
+** struct aio_queue - describes a queue of active I/O requests
+** *   fd - file descriptor of file to be read or written
+** *   seekable - indicates whether the file is seekable
+** *   append - indicates whether the file is opened with O_APPEND
+** *   ref - reference count
+** *   init - indicates whether the queue has been initialized
+** *   lock - lock for aio_queue
+** *   cond - condition variable for aio_queue
+** *   head - pointer to first active I/O request in list
+*/
 struct aio_queue {
 	int fd, seekable, append, ref, init;
 	pthread_mutex_t lock;
@@ -64,6 +95,15 @@ struct aio_queue {
 	struct aio_thread *head;
 };
 
+/*
+** Used to pass arguments to the aio thread, during pthread_create.
+** 
+** struct aio_args - describes arguments for aio thread
+** *   cb - pointer to aiocb for I/O request
+** *   q - pointer to aio_queue for I/O request
+** *   op - operation to be performed (LIO_READ, LIO_WRITE, O_SYNC, O_DSYNC)
+** *   sem - semaphore for aio thread
+*/
 struct aio_args {
 	struct aiocb *cb;
 	struct aio_queue *q;
@@ -71,15 +111,41 @@ struct aio_args {
 	sem_t sem;
 };
 
+/* 
+** maplock - lock for aio_queue
+** map - 4-level table mapping file descriptor numbers to aio queues
+** aio_fd_cnt - number of active I/O requests total
+** __aio_fut - indicates whether there are any active I/O requests
+*/
 static pthread_rwlock_t maplock = PTHREAD_RWLOCK_INITIALIZER;
 static struct aio_queue *****map;
 static volatile int aio_fd_cnt;
 volatile int __aio_fut;
 
+/* io_thread_stack_size - stack size for aio thread */
 static size_t io_thread_stack_size;
 
 #define MAX(a,b) ((a)>(b) ? (a) : (b))
 
+/* 
+** Every fd with an active aio operation request is present in the aio_queue.
+** There are many aio_queue structures, each of which has a list of active aio_thread structures.
+** To assign an aio_queue to a fd, we use a 4-level table mapping file descriptor numbers to aio queues.
+** So queue is decided by the hash of fd.
+** And map is a 4-level table mapping file descriptor numbers to aio queues.
+**
+** __aio_get_queue - gets the locked aio_queue for a given file descriptor (and allocates it if needed)
+** @fd - file descriptor of file to be read or written
+** @need - indicates whether the aio_queue is needed
+** Returns a pointer to the aio_queue for the given file descriptor.
+**
+** struct aio_queue *****map;
+** map = calloc(sizeof *map, (-1U/2+1)>>24); // sizeof *map = sizeof aio_queue ****
+** map[a] = calloc(sizeof **map, 256); // sizeof **map = sizeof aio_queue ***
+** map[a][b] = calloc(sizeof ***map, 256); // sizeof ***map = sizeof aio_queue **
+** map[a][b][c] = calloc(sizeof ****map, 256); // sizeof ****map = sizeof aio_queue *
+** map[a][b][c][d] = calloc(sizeof *****map, 1); // sizeof *****map = sizeof aio_queue
+*/
 static struct aio_queue *__aio_get_queue(int fd, int need)
 {
 	sigset_t allmask, origmask;
@@ -114,7 +180,7 @@ static struct aio_queue *__aio_get_queue(int fd, int need)
 		if (!(q = map[a][b][c][d])) {
 			map[a][b][c][d] = q = calloc(sizeof *****map, 1);
 			if (q) {
-				q->fd = fd;
+				q->fd = fd; // TODO: There can be multiple fds with same hash, so this is not enough. (we generaly don't care about it)
 				pthread_mutex_init(&q->lock, 0);
 				pthread_cond_init(&q->cond, 0);
 				a_inc(&aio_fd_cnt);
@@ -128,6 +194,14 @@ out:
 	return q;
 }
 
+/*
+** called by cleanup handler.
+** if this is the last reference, remove the aio_queue from the map.
+** NOTE: there are 2 checks for refcount in case of the last ref, first one is lazy check and the second one is take the lock and check.
+**
+** __aio_unref_queue - unref the aio_queue
+** @q - pointer to aio_queue for I/O request
+*/
 static void __aio_unref_queue(struct aio_queue *q)
 {
 	if (q->ref > 1) {
@@ -158,6 +232,17 @@ static void __aio_unref_queue(struct aio_queue *q)
 	}
 }
 
+/*
+** init the retuen value in the cb from the aio_thread structure.
+** mark the aio_thread structure as not running.
+** init the error code in the cb from the aio_thread structure.
+** wake up all the waiters, see the comment in the cleanup function.
+** Remove the aio_thread structure from the queue.
+** Notify the user thread that aio request has been processed, through the signal or callback function. (struct sigevent aio_sigevent)
+**
+** cleanup - cleanup handler for aio thread
+** @ctx - pointer to aio_thread structure
+*/
 static void cleanup(void *ctx)
 {
 	struct aio_thread *at = ctx;
@@ -208,6 +293,14 @@ static void cleanup(void *ctx)
 	}
 }
 
+/*
+** create aio_thread and push it to the queue.
+** And do sem_post(&args.sem); to notify the caller that the thread is created, work is sucessfully registered in the queue.
+** register cleanup handler for the thread.
+** wait for the sequenced operations.
+** do the I/O operation.
+** cleanup handler will be called when the thread exits.
+*/
 static void *io_thread_func(void *ctx)
 {
 	struct aio_thread at, *p;
@@ -279,6 +372,19 @@ static void *io_thread_func(void *ctx)
 	return 0;
 }
 
+/*
+** For the given aio request, get the queue, init the thread args, and create the thread with the arguments.
+** we use sem_wait to wait for the thread to complete the io operation.
+** At the begining we did sem_init(&args.sem, 0, 0);
+** thread_func will do sem_post(&args.sem); worker thread to register the work in the queue (NOTE: we are not waiting till completion).
+** As soon as work is registered, we are returning from submit, and caller can do other work.
+** We have got the queue and incremented the ref count in it, but worker thread will put the the io_thread in the queue.
+** And cleanup will remove the thread from the queue.
+**
+** submit - submits an aio request
+** @cb - pointer to aiocb for I/O request
+** @op - operation to be performed (LIO_READ, LIO_WRITE, O_SYNC, O_DSYNC)
+*/
 static int submit(struct aiocb *cb, int op)
 {
 	int ret = 0;
@@ -321,7 +427,7 @@ static int submit(struct aiocb *cb, int op)
 	pthread_sigmask(SIG_SETMASK, &origmask, 0);
 
 	if (!ret) {
-		while (sem_wait(&args.sem));
+		while (sem_wait(&args.sem)); // wait for the thread to register the work in the queue (not till completion)
 	}
 
 	return ret;
@@ -357,6 +463,16 @@ int aio_error(const struct aiocb *cb)
 	return cb->__err & 0x7fffffff;
 }
 
+/*
+** get the queue.
+** Cancle the worker thread, because worker thread have registered the cleanup handler, it will do the cleanup.
+** Wait for cleanup handler to complete.
+** When the cleanup is does the cleanup handler will mark the aio_thread structure as not running.
+**
+** aio_cancel - cancels an aio request in whole queue, hoping that all the requests are for same fd. (Hash colision is possible)
+** @fd - file descriptor of file to be read or written
+** @cb - pointer to aiocb for I/O request
+*/
 int aio_cancel(int fd, struct aiocb *cb)
 {
 	sigset_t allmask, origmask;
@@ -384,7 +500,7 @@ int aio_cancel(int fd, struct aiocb *cb)
 		/* Transition target from running to running-with-waiters */
 		if (a_cas(&p->running, 1, -1)) {
 			pthread_cancel(p->td);
-			__wait(&p->running, 0, -1, 1);
+			__wait(&p->running, 0, -1, 1); // Wait for worker thread to enter cleanup handler, and do the cleanup.
 			if (p->err == ECANCELED) ret = AIO_CANCELED;
 		}
 	}
@@ -402,6 +518,20 @@ int __aio_close(int fd)
 	return fd;
 }
 
+/*
+** When fork is called for the multithreaded process, the child process whill have only one thread.
+** And the shared states will be copied to the child process, which can be in inconsistent state.
+** So we need to reset the shared states in the child process.
+** And in this case we are intentionally having memory leaks, because we not not sure that queue lock is in consistent state.
+** so the here whole queue is getting dropped without making it free, (we are not freeing the memory).
+**
+** This is a common probelm for all the shared states in the multithreaded process, when fork is called.
+** malloc is not fork safe, so we can not use malloc in the child process, so malloc also needs to be reset.
+** see all the other things we do in : src/process/fork.c::fork()
+**
+** Using fork() in a multithreaded process:					https://www.qnx.com/developers/docs/7.0.0/#com.qnx.doc.neutrino.getting_started/topic/javascriptwindow.print();
+** Fork() without exec() is dangerous in large programs :	https://news.ycombinator.com/item?id=12302539
+*/
 void __aio_atfork(int who)
 {
 	if (who<0) {
