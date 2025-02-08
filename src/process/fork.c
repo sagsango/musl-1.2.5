@@ -44,6 +44,10 @@ static void dummy_0(void) { }
 weak_alias(dummy_0, __tl_lock);
 weak_alias(dummy_0, __tl_unlock);
 
+/*
+** fork() is called in the multithreaded process, so we need to reset the shared states in the child process.
+** if (need_locks)  is checking if processes is multithreaded or not, and if it is multithreaded then we need to reset the shared states.
+*/
 pid_t fork(void)
 {
 	sigset_t set;
