@@ -519,6 +519,10 @@ int __aio_close(int fd)
 }
 
 /*
+** How to handle fork of the multithreaded process
+** 1.Priority: the thread who is going to do to fork() can take the lock, so that child will come as lock owner.
+** 2.Priority: if not 1st case; do memory leaks for the shared locks, create new ones. 
+** 
 ** When fork is called for the multithreaded process, the child process whill have only one thread.
 ** And the shared states will be copied to the child process, which can be in inconsistent state.
 ** So we need to reset the shared states in the child process.

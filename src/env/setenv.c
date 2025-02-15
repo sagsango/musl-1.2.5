@@ -2,6 +2,10 @@
 #include <string.h>
 #include <errno.h>
 
+/*
+TODO: I dont know why we are maining these static variables 
+      which seems exactly same as __environment
+*/
 void __env_rm_add(char *old, char *new)
 {
 	static char **env_alloced;
