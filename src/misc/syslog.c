@@ -30,6 +30,11 @@ int setlogmask(int maskpri)
 	return ret;
 }
 
+/*
+ *
+ * XXX:
+ *  Named socket add for the syslog
+ */
 static const struct {
 	short sun_family;
 	char sun_path[9];
@@ -38,6 +43,10 @@ static const struct {
 	"/dev/log"
 };
 
+/*
+ * XXX:
+ *  Close log socket
+ */
 void closelog(void)
 {
 	int cs;
@@ -55,6 +64,10 @@ static void __openlog()
 	if (log_fd >= 0) connect(log_fd, (void *)&log_addr, sizeof log_addr);
 }
 
+/*
+ * XXX:
+ *  Open log socket
+ */
 void openlog(const char *ident, int opt, int facility)
 {
 	int cs;
@@ -136,6 +149,10 @@ static void __vsyslog(int priority, const char *message, va_list ap)
 	pthread_setcancelstate(cs, 0);
 }
 
+/*
+ * XXX:
+ *  Log the messge into the socket
+ */
 void syslog(int priority, const char *message, ...)
 {
 	va_list ap;
