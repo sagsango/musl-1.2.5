@@ -2,6 +2,7 @@
 #include <limits.h>
 #include "pthread_impl.h"
 
+/* XXX: posix sem also use the cas */
 int sem_trywait(sem_t *sem)
 {
 	int val;
